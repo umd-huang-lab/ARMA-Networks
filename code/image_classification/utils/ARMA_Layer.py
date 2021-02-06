@@ -1,6 +1,10 @@
 import math
+import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import torch.utils.checkpoint as checkpoint
+
 
 class ARMA2d(nn.Module):
     def __init__(self, in_channels, out_channels,
@@ -24,12 +28,17 @@ class ARMA2d(nn.Module):
 
     def forward(self, x):
         """
-        Compuation of the 2D-ARMA layer.
+        Computation of the 2D-ARMA layer.
         """
+
+        # x = checkpoint.checkpoint(self.forward_pass, x)
+        
         # size:[M, S, I1, I2]->[M, T, I1, I2]->[M, T, I1, I2]
         x = self.moving_average(x)
+        # x = checkpoint.checkpoint(self.autoregressive, x)
         x = self.autoregressive(x)
         return x
+
 
 class AutoRegressive2d(nn.Module):
     def __init__(self, channels, kernel_size = 3, 
@@ -44,7 +53,7 @@ class AutoRegressive2d(nn.Module):
             self.a = AutoRegressive_circular(channels, 
                 kernel_size, padding, stride, dilation, init)
 
-        elif paddind_mode == "reflect":
+        elif padding_mode == "reflect":
             self.a = AutoRegressive_reflect( channels, 
                 kernel_size, padding, stride, dilation, init)
         else: 
@@ -66,8 +75,14 @@ class AutoRegressive_circular(nn.Module):
         """
         super(AutoRegressive_circular, self).__init__()
 
-        self.alpha = nn.Parameter(torch.Tensor(channels, kernel_size // 2, 4)) # size: [T, P, 4]
+        # size: [T, P, 2, 2]
+        self.alpha = nn.Parameter(torch.Tensor(channels, kernel_size // 2, 2, 2), requires_grad=True)
         self.set_parameters(init)
+
+        # size: [2, 2*dilation + 1]
+        self.alpha_weights = self.generate_alpha_weights(dilation)
+
+        self.dummy = nn.Parameter(requires_grad=True)
 
     def set_parameters(self, init):
         """
@@ -76,60 +91,122 @@ class AutoRegressive_circular(nn.Module):
         bound = -math.log(1 - init)
         nn.init.uniform_(self.alpha, a = -bound, b = bound)
 
+    def generate_alpha_weights(self, dilation):
+        alpha_weights = torch.zeros((2, 2 * dilation + 1), dtype=torch.float)
+        alpha_weights[0, 0] = math.cos(-math.pi / 4)
+        alpha_weights[1, 0] = -math.sin(-math.pi / 4)
+        alpha_weights[0, -1] = math.sin(-math.pi / 4)
+        alpha_weights[1, -1] = math.cos(-math.pi / 4)
+        
+        return alpha_weights
+
     def forward(self, x):
         """
-        Computation of the 2D-AutoRegressive layer. 
-        """    
-        x = autoregressive_circular(x, self.alpha)
+        Computation of the 2D-AutoRegressive layer.
+        """
+        
+        # alpha_weights should automatically be moved to the GPU, but it isn't for some reason
+        # x = checkpoint.checkpoint(autoregressive_circular,
+        #                          x, self.alpha, self.alpha_weights.to(self.alpha.device), self.dummy)
+        x = autoregressive_circular(x, self.alpha, self.alpha_weights.to(self.alpha.device), self.dummy)
+        
         return x
 
 
-def autoregressive_circular(x, alpha):
+@torch.jit.script
+def parameterized_weights_forward(x, alpha, alpha_weights):
+    # size: [T, P, 2, 2]
+    alpha = alpha.tanh()
+    
+    # size: [T, P, 2, 2] x [2, 3] -> [T, P, 2, 3]
+    A_xy = torch.matmul(alpha, alpha_weights)
+    A_xy[:, :, :, A_xy.size(2) // 2] = 1.0
+    
+    # size: [T, P, 2, 3] -> [T, P, 1, 3], [T, P, 1, 3]
+    A_x, A_y = torch.chunk(A_xy, 2, 2)
+    
+    # size: [T, P, 1, 3], [T, P, 1, 3] -> [T, P, 3, 3]
+    A = torch.einsum('tzai,tzbj->tzij', (A_x, A_y))
+    
+    # size: [T, P, 3, 3] -> [T, P, I1, I2]
+    A_pad = F.pad(A, (0, x.size(-2) - 3, 0, x.size(-1) - 3))
+    A_roll = torch.roll(A_pad, (-1, -1), (-2, -1))  # these numbers are specific
+    
+    return A_roll, alpha, alpha_weights
+
+
+@torch.jit.script
+def parameterized_weights_backward(alpha_tanh, alpha_weights, Agrad):
+    # (forward pass recomputation)
+    # size: [T, P, 2, 2] x [2, 3] -> [T, P, 2, 3] -> [T, P, 2, 2]
+    A_xy = torch.matmul(alpha_tanh, alpha_weights)[..., 0:3:2]
+    
+    # (forward pass recomputation)
+    # size: [T, P, 2, 2] -> [T, P, 1, 2], [T, P, 1, 2]
+    A_x, A_y = torch.chunk(A_xy, 2, 2)
+    
+    # ∇Ax = Ay * (∇A)^T
+    # size: [T, P, 1, 2] x [T, P, 2, 3] -> [T, P, 1, 3]
+    Ax_grad = torch.matmul(A_y, Agrad.transpose(-2, -1)[:, :, 0:3:2, :])
+    
+    # ∇Ay = Ax * ∇A
+    # size: [T, P, 1, 2] x [T, P, 2, 3] -> [T, P, 1, 3]
+    Ay_grad = torch.matmul(A_x, Agrad[:, :, 0:3:2, :])
+    
+    # size: [T, P, 1, 3], [T, P, 1, 3] -> [T, P, 2, 3]
+    Axy_grad = torch.cat((Ax_grad, Ay_grad), dim=2)
+    
+    # ∇α = ∇Axy * alpha_weights^T
+    # size: [T, P, 2, 3] x [2, 3]^T -> [T, P, 2, 2]
+    alpha_grad = torch.matmul(Axy_grad, alpha_weights.transpose(-2, -1))
+    
+    # size: [T, P, 2, 2]
+    alpha_grad = alpha_grad * (1 - alpha_tanh ** 2)
+    
+    return alpha_grad
+
+
+class GenerateParameterizedWeights(torch.autograd.Function):
+    
+    @staticmethod
+    def forward(ctx, x, alpha, alpha_weights):
+        A, alpha_tanh, alpha_weights = parameterized_weights_forward(x, alpha, alpha_weights)
+        
+        ctx.save_for_backward(alpha_tanh, alpha_weights)
+        
+        return A
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        alpha_tanh, alpha_weights = ctx.saved_tensors
+        
+        # size: [T, P, I1, I2] -x> [T, P, 3, 3]
+        Agrad = grad_output[:, :, [[-1], [0], [1]], [[-1, 0, 1]]]
+        
+        alpha_grad = parameterized_weights_backward(alpha_tanh, alpha_weights, Agrad)
+        
+        return None, alpha_grad, None
+
+
+generate_parameterized_weights = GenerateParameterizedWeights.apply
+
+
+def autoregressive_circular(x, alpha, alpha_weights, dummy):
     """
     Computation of a 2D-AutoRegressive layer (with circular padding).
     """
 
-    if  x.size()[-2] < alpha.size()[1] * 2 + 1 or \
-        x.size()[-1] < alpha.size()[1] * 2 + 1:
+    if x.size(-2) < alpha.size(1) * 2 + 1 or \
+            x.size(-1) < alpha.size(1) * 2 + 1:
         return x
 
-    # each chunk is [T, P, 1]
-    alpha = alpha.tanh() / math.sqrt(2)
-    chunks = torch.chunk(alpha, alpha.size()[-1], -1)
+    # size: -> [T, P, I1, I2]
+    A = generate_parameterized_weights(x, alpha, alpha_weights)
 
-    # size: [T, P, 1]
-    A_x_left  = (chunks[0] * math.cos(-math.pi / 4) - 
-                 chunks[1] * math.sin(-math.pi / 4))
-
-    A_x_right = (chunks[0] * math.sin(-math.pi / 4) +
-                 chunks[1] * math.cos(-math.pi / 4))
-
-    A_y_left  = (chunks[2] * math.cos(-math.pi / 4) - 
-                 chunks[3] * math.sin(-math.pi / 4))
-
-    A_y_right = (chunks[2] * math.sin(-math.pi / 4) + 
-                 chunks[3] * math.cos(-math.pi / 4))
-
-    # size: [T, P, 3]->[T, P, I1] or [T, P, I2]
-    A_x = torch.cat((torch.ones(chunks[0].size(), device=alpha.device), 
-        A_x_right, torch.zeros(chunks[0].size()[0], chunks[0].size()[1],
-        x.size()[-2] - 3, device = alpha.device), A_x_left), -1)
-
-    A_y = torch.cat((torch.ones(chunks[2].size(), device = alpha.device), 
-        A_y_right, torch.zeros(chunks[2].size()[0], chunks[2].size()[1], 
-        x.size()[-1] - 3, device = alpha.device), A_y_left), -1)
-
-    # size: [T, P, I1] + [T, P, I2] -> [T, P, I1, I2]
-    A = torch.einsum('tzi,tzj->tzij',(A_x, A_y))
-
-    # Complex Division: FFT/FFT -> irFFT
-    A_s = torch.chunk(A, A.size()[1], 1)
-    for i in range(A.size()[1]):
-        x = ar_circular_Autograd(x, torch.squeeze(A_s[i], 1))
+    for A_s in torch.chunk(A, A.size(1), 1):
+        x = ar_circular_Autograd(x, torch.squeeze(A_s, 1))
 
     return x
-
-
 
 
 def ar_circular_Autograd(x, a):
@@ -139,7 +216,8 @@ def ar_circular_Autograd(x, a):
     y = torch.irfft(Y, 2, onesided=False) # size:[M, T, I1, I2]
     return y
 
-class ar_circular_Func(torch.autograd.Function):
+
+class ARCircular(torch.autograd.Function):
 
     # x size: [M, T, I1, I2]
     # a size:[T, I1, I2]
@@ -163,7 +241,6 @@ class ar_circular_Func(torch.autograd.Function):
         [T, I1, I2] * [M, T, I1, I2]   = [M, T, I1, I2]
         """
         A, Y = ctx.saved_tensors
-        grad_x = grad_a = None  
 
         grad_Y = torch.rfft(grad_y, 2, onesided=False)
         intermediate = complex_division(grad_Y, A, trans_deno=True)               # size:[M,T,I1,I2]
@@ -174,8 +251,8 @@ class ar_circular_Func(torch.autograd.Function):
         return grad_x, grad_a
 
 
-
-def complex_division(x, A, trans_deno=False):
+@torch.jit.script
+def complex_division(x, A, trans_deno: bool = False):
     a, b = torch.chunk(x, 2, -1)
     c, d = torch.chunk(A, 2, -1)
 
@@ -196,8 +273,8 @@ def complex_division(x, A, trans_deno=False):
     return res
 
 
-
-def complex_multiplication(x, A, trans_deno=False):
+@torch.jit.script
+def complex_multiplication(x, A, trans_deno: bool = False):
     a, b = torch.chunk(x, 2, -1)
     c, d = torch.chunk(A, 2, -1)
 
