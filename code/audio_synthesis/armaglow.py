@@ -1,3 +1,8 @@
+"""ARMAGlow, ARMA layer implementation for WaveGlow speech synthesis network
+
+Adapted from WaveGlow implementation:
+https://github.com/NVIDIA/DeepLearningExamples/blob/master/PyTorch/SpeechSynthesis/Tacotron2/waveglow/model.py
+"""
 import math
 import torch
 from torch.autograd import Variable
@@ -25,6 +30,7 @@ class ARMA1d(torch.nn.Module):
         """
         super(ARMA1d, self).__init__()
 
+        # Uses 1d convolutions instead of 2d
         self.moving_average = torch.nn.Conv1d(
             channels,
             channels,
@@ -36,6 +42,7 @@ class ARMA1d(torch.nn.Module):
             bias=bias,
         )
 
+        # Uses 1d convolutions instead of 2d
         self.autoregressive = AutoRegressive1d(
             channels,
             a_kernel_size,
@@ -53,9 +60,9 @@ class ARMA1d(torch.nn.Module):
         batch_size, group_size, n_of_groups = x.size()
 
         W = self.moving_average.weight.squeeze()
-
         # Forward computation
         log_det_W = batch_size * n_of_groups * torch.logdet(W.unsqueeze(0).float()).squeeze()
+
         # size:[M, S, I1, I2]->[M, T, I1, I2]->[M, T, I1, I2]
         x = self.moving_average(x)
         x = self.autoregressive(x)
@@ -98,6 +105,7 @@ class AutoRegressiveCircular(torch.nn.Module):
         Initialization of a 1D-AutoRegressive layer (with circular padding).
         """
         super(AutoRegressiveCircular, self).__init__()
+        # For 1d AR circular, we can just use Conv1d with circular padding
         self.alpha = torch.nn.Conv1d(
             channels,
             channels,
@@ -107,13 +115,13 @@ class AutoRegressiveCircular(torch.nn.Module):
             stride=stride,
             dilation=dilation
         )
-        #torch.nn.Parameter(torch.Tensor(channels, kernel_size // 2, 4))  # size:[T, P, 4]
 
     def forward(self, x):
         """
         Computation of the 1D-AutoRegressive layer (with circular padding).
         """
         return self.alpha(x)
+
 
 @torch.jit.script
 def fused_add_tanh_sigmoid_multiply(input_a, input_b, n_channels):

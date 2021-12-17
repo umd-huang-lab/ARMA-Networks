@@ -1,3 +1,4 @@
+"""Evaluation metric implementations for audio synthesis tasks"""
 import glob
 import warnings
 from pathlib import Path
